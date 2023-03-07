@@ -3,14 +3,13 @@ name = "psplit"
 version = "0.1.0"
 edition = "2021"
 authors = ["Chibuzor Enukoha <enukohachibuzor@gmail.com>"]
-about = "ConView Pipe Spliting program"
+description = "ConView Pipe Spliting program"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
 rust-ini = "0.18"
-notify = "5.1.0"
 ipipe = "0.11.7"
-mio = { version = "0.8", features = ["os-poll", "os-ext", "net"] }
+mio = { version = "0.8", features = ["os-poll", "os-ext"] }
 clap = { version = "4.1.8", features = ["derive"] }
 
 

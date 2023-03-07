@@ -2,7 +2,7 @@ use psplit::{PSplit};
 
 use clap::Parser;
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Absolute Path to configuration file
@@ -17,13 +17,14 @@ struct Cli {
     #[arg(short, long)]
     reload: bool,
 }
+
 fn run_with_reload(_cli: &Cli) {
     todo!()
 }
 
 fn run(cli: &Cli) {
     let mut splitter = PSplit::new();
-    splitter.start(&cli.config)
+    splitter.config_from_file(&cli.config).start()
 }
 
 fn main() {

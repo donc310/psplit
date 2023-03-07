@@ -19,41 +19,30 @@ use std::os::unix::io::IntoRawFd;
 
 const PIPE_RECV: Token = Token(0);
 const PIPE_SEND: Token = Token(1);
-const TIME_OUT: time::Duration = time::Duration::from_secs(1);
+const TIME_OUT: time::Duration = time::Duration::from_millis(100);
 ///
-pub enum Message {
+#[derive(Debug)]
+enum Message {
     Write(Box<String>),
     Terminate,
+}
+
+///
+///
+///
+enum WriteFlow {
+    Break,
+    Restart,
 }
 ///
 struct Writer {
     signal: Arc<Mutex<u8>>,
-    config: SplitOut,
+    config: Arc<SplitOut>,
     receiver: mpsc::Receiver<Message>,
-}
-
-///
-struct Reader {
-    signal: Arc<Mutex<u8>>,
-    write_signal: Arc<Mutex<u8>>,
+    ignore_first_message: bool,
 }
 ///
-///
-///
-pub struct PSplit {
-    reading_threads: Vec<thread::JoinHandle<Result<(), std::io::Error>>>,
-    running: bool,
-    signal: Arc<Mutex<u8>>,
-}
-///
-///
-///
-pub enum WriteFlow {
-    Break,
-    Restart,
-}
-
-impl Writer {
+impl<'a> Writer {
     ///
     ///
     ///
@@ -100,7 +89,7 @@ impl Writer {
     ///
     ///
     ///
-    fn open_pipe(&self) -> Result<File, std::io::Error> {
+    fn open_pipe(&mut self) -> Result<File, std::io::Error> {
         let pipe = self.config.pipe.clone();
 
         match Self::create(&pipe, Some(0o777)) {
@@ -123,7 +112,7 @@ impl Writer {
     ///
     ///
     ///
-    fn should_stop(&self) -> bool {
+    fn should_stop(&mut self) -> bool {
         let state = self.signal.lock().unwrap();
         *state == 1
     }
@@ -131,7 +120,7 @@ impl Writer {
     ///
     ///
     ///
-    fn write(&self, contents: &[u8], sender: &pipe::Sender) -> Result<usize, io::Error> {
+    fn write(&mut self, contents: &[u8], sender: &pipe::Sender) -> Result<usize, io::Error> {
         let op = sender.try_io(|| {
             let buf_ptr = contents as *const _ as *const _;
             let res = unsafe { libc::write(sender.as_raw_fd(), buf_ptr, contents.len()) };
@@ -149,9 +138,7 @@ impl Writer {
     ///
     ///
     ///
-    fn run_loop(&self) -> Result<(), std::io::Error> {
-        let one_secs = time::Duration::from_secs(1);
-
+    fn run_loop(&mut self) -> Result<(), std::io::Error> {
         loop {
             if self.should_stop() {
                 break;
@@ -163,12 +150,8 @@ impl Writer {
                     io::ErrorKind::PermissionDenied => {
                         return Err(e);
                     }
-                    io::ErrorKind::Unsupported => todo!(),
-                    io::ErrorKind::UnexpectedEof => todo!(),
-                    io::ErrorKind::OutOfMemory => todo!(),
-                    io::ErrorKind::Other => todo!(),
                     _ => {
-                        thread::sleep(one_secs);
+                        thread::sleep(TIME_OUT);
                         continue;
                     }
                 },
@@ -200,16 +183,14 @@ impl Writer {
     ///
     ///
     ///
-    fn loop_till_stopped(&self, poll: &mut Poll, sender: &pipe::Sender) -> WriteFlow {
+    fn loop_till_stopped(&mut self, poll: &mut Poll, sender: &pipe::Sender) -> WriteFlow {
         let mut events = Events::with_capacity(8);
-        let timeout = Some(time::Duration::from_secs(2));
-
         loop {
             if self.should_stop() {
                 break;
             }
 
-            match poll.poll(&mut events, timeout) {
+            match poll.poll(&mut events, Some(TIME_OUT)) {
                 Ok(_) => {}
                 Err(_) => {
                     return WriteFlow::Restart;
@@ -229,10 +210,11 @@ impl Writer {
     }
 
     /// Read messages from channel while sender is writable
-    ///
-    ///
-    ///
-    fn loop_write_messages(&self, event: &mio::event::Event, sender: &pipe::Sender) -> WriteFlow {
+    fn loop_write_messages(
+        &mut self,
+        event: &mio::event::Event,
+        sender: &pipe::Sender,
+    ) -> WriteFlow {
         loop {
             if event.is_write_closed() || self.should_stop() {
                 break;
@@ -240,12 +222,21 @@ impl Writer {
 
             match self.receiver.recv_timeout(TIME_OUT) {
                 Ok(m) => match m {
-                    Message::Write(_data) => {
-                        let contents = _data.as_bytes();
+                    Message::Write(data) => {
+                        let contents = data.as_bytes();
+                        if self.ignore_first_message{
+                            self.ignore_first_message = false;
+                            continue;
+                        }
                         match self.write(contents, sender) {
                             Err(e) => match e.kind() {
-                                io::ErrorKind::BrokenPipe => return WriteFlow::Restart,
-                                _ => {}
+                                io::ErrorKind::BrokenPipe => {
+                                    self.ignore_first_message = true;
+                                    return WriteFlow::Restart;
+                                }
+                                _others => {
+                                    println!("{}", e)
+                                }
                             },
                             _ => {}
                         }
@@ -273,8 +264,13 @@ impl Writer {
     ///
     ///
     ///
-    fn new(signal: Arc<Mutex<u8>>, config: SplitOut, receiver: mpsc::Receiver<Message>) -> Writer {
+    fn new(
+        signal: Arc<Mutex<u8>>,
+        config: Arc<SplitOut>,
+        receiver: mpsc::Receiver<Message>,
+    ) -> Writer {
         Writer {
+            ignore_first_message: false,
             signal,
             config,
             receiver,
@@ -282,100 +278,160 @@ impl Writer {
     }
 }
 
-impl Reader {
-    ///
-    ///
+struct MessageSender {
+    /// if the sender has been dropped
+    disconnected: bool,
+    /// send channel
+    sender: mpsc::SyncSender<Message>,
+}
+
+///
+struct Reader {
+    signal: Arc<Mutex<u8>>,
+    config: Arc<SplitIn>,
+    send_channels: Vec<MessageSender>,
+    write_signal: Arc<Mutex<u8>>,
+}
+
+impl<'a> Reader {
     ///
     fn should_stop(&self) -> bool {
         let state = self.signal.lock().unwrap();
         *state == 1
     }
+
     ///
-    ///
-    ///
-    ///
-    fn send_message(&self, m: Message, channels: &Vec<mpsc::SyncSender<Message>>) {
-        for c in channels {
+    fn send_message(&mut self, m: Message) {
+        for c in self.send_channels.iter_mut() {
+            if c.disconnected {
+                continue;
+            }
             match m {
                 Message::Write(ref data) => {
-                    match c.try_send(Message::Write(Box::new(*data.clone()))) {
-                        Ok(_) => {}
+                    match c.sender.try_send(Message::Write(Box::new(*data.clone()))) {
                         Err(e) => match e {
-                            mpsc::TrySendError::Full(_) => {
-                                println!("{}", e)
-                            }
                             mpsc::TrySendError::Disconnected(_) => {
-                                println!("{}", e)
+                                c.disconnected = true;
                             }
+                            _ => {}
                         },
+                        _ => {}
                     }
                 }
-                Message::Terminate => match c.try_send(Message::Terminate) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        println!("{}", e)
+
+                Message::Terminate => match c.sender.try_send(Message::Terminate) {
+                    // On failure disconnect
+                    Err(_e) => {
+                        c.disconnected = true;
                     }
+                    _ => {}
                 },
             };
         }
     }
+
     ///
-    ///
-    ///
-    ///
-    fn new(signal: Arc<Mutex<u8>>) -> Reader {
+    fn new(signal: Arc<Mutex<u8>>, config: Arc<SplitIn>) -> Reader {
+        let cap = config.outputs.len();
         Reader {
             signal,
+            config,
             write_signal: Arc::new(Mutex::new(0)),
+            send_channels: Vec::with_capacity(cap),
         }
     }
+
     ///
-    ///
-    ///
-    ///
-    ///
-    fn open_pipe(pipe: &String) -> Result<File, std::io::Error> {
+    fn open_pipe(&mut self) -> Result<File, std::io::Error> {
         let f = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open(Path::new(&pipe));
+            .open(Path::new(&self.config.pipe));
 
         f
     }
 
-    // Create output workers defined in the
-    //
-    //
-    fn start_write_channels(&self, split_config: SplitIn) -> Vec<mpsc::SyncSender<Message>> {
-        let mut channels = Vec::new();
+    /// Create output workers defined in the
+    fn start_write_channels(&'a mut self) -> &'a mut Self {
+        self.send_channels.clear();
 
-        for out in split_config.outputs.into_iter() {
+        for out in self.config.outputs.iter() {
             if !out.configuration.enabled {
                 continue;
             }
             let signal = Arc::clone(&self.write_signal);
+            let config = Arc::clone(out);
+
             let (sender, receiver) = mpsc::sync_channel(1);
 
-            channels.push(sender);
+            self.send_channels.push(MessageSender {
+                disconnected: false,
+                sender,
+            });
 
             thread::spawn(move || -> Result<(), std::io::Error> {
-                let witter = Writer::new(signal, out, receiver);
+                let mut witter = Writer::new(signal, config, receiver);
                 witter.run_loop()
             });
         }
-
-        channels
+        self
     }
+
     ///
+    fn run_read_loop(&mut self) -> Result<(), std::io::Error> {
+        let pipe = match self.open_pipe() {
+            Ok(f) => f,
+            Err(e) => {
+                println!("File -> {} Error {:?} ", &self.config.pipe, e);
+                return Err(e);
+            }
+        };
+        let mut poll = Poll::new()?;
+
+        let mut receiver = unsafe { pipe::Receiver::from_raw_fd(pipe.into_raw_fd()) };
+        let mut reader =
+            unsafe { std::io::BufReader::new(File::from_raw_fd(receiver.as_raw_fd())) };
+
+        poll.registry()
+            .register(&mut receiver, PIPE_RECV, Interest::READABLE)?;
+
+        println!("Reading data <- {}", &self.config.pipe);
+
+        match self.loop_till_stopped(&mut poll, &mut reader) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                println!("{:?}", err);
+                return Err(err);
+            }
+        }
+    }
+
     ///
-    ///
-    ///
-    fn loop_read_pipe(
-        &self,
-        event: &mio::event::Event,
+    fn loop_till_stopped(
+        &mut self,
+        poll: &mut Poll,
         reader: &mut BufReader<File>,
-        channels: &Vec<mpsc::SyncSender<Message>>,
-    ) {
+    ) -> Result<(), std::io::Error> {
+        let mut events = Events::with_capacity(8);
+        loop {
+            if self.should_stop() {
+                self.send_message(Message::Terminate);
+                break;
+            }
+            poll.poll(&mut events, Some(TIME_OUT))?;
+
+            for event in &events {
+                if event.token() == PIPE_RECV && event.is_readable() {
+                    self.loop_read_pipe(event, reader);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    ///
+    fn loop_read_pipe(&mut self, event: &mio::event::Event, reader: &mut BufReader<File>) {
         loop {
             if event.is_read_closed() {
                 break;
@@ -387,13 +443,10 @@ impl Reader {
                     if bytes_read == 0 {
                         break;
                     }
-                    self.send_message(Message::Write(Box::new(buffer)), channels);
+                    self.send_message(Message::Write(Box::new(buffer)));
                 }
                 Err(err) => match err.kind() {
                     io::ErrorKind::BrokenPipe => {
-                        println!("{:?}", err)
-                    }
-                    io::ErrorKind::AlreadyExists => {
                         println!("{:?}", err)
                     }
                     io::ErrorKind::WouldBlock => {
@@ -406,74 +459,13 @@ impl Reader {
             };
         }
     }
-    ///
-    ///
-    ///
-    ///
-    fn loop_till_stopped(
-        &self,
-        poll: &mut Poll,
-        reader: &mut BufReader<File>,
-        channels: &Vec<mpsc::SyncSender<Message>>,
-    ) -> Result<(), std::io::Error> {
-        let mut events = Events::with_capacity(8);
-        let timeout = Some(time::Duration::from_secs(2));
-
-        loop {
-            if self.should_stop() {
-                self.send_message(Message::Terminate, channels);
-                break;
-            }
-            poll.poll(&mut events, timeout)?;
-
-            for event in &events {
-                if event.token() == PIPE_RECV && event.is_readable() {
-                    self.loop_read_pipe(event, reader, channels)
-                }
-            }
-        }
-
-        Ok(())
-    }
-    ///
-    ///
-    ///
-    fn start(&self, split_config: SplitIn) -> Result<(), std::io::Error> {
-        let pipe_name = split_config.pipe.clone();
-
-        let pipe = match Self::open_pipe(&pipe_name) {
-            Ok(f) => f,
-            Err(e) => {
-                println!("File -> {} Error {:?} ", &pipe_name, e);
-                return Err(e);
-            }
-        };
-
-        let channels = self.start_write_channels(split_config);
-
-        if channels.len() == 0 {
-            return Ok(());
-        }
-
-        let mut poll = Poll::new()?;
-
-        let mut receiver = unsafe { pipe::Receiver::from_raw_fd(pipe.into_raw_fd()) };
-        let mut reader =
-            unsafe { std::io::BufReader::new(File::from_raw_fd(receiver.as_raw_fd())) };
-
-        poll.registry()
-            .register(&mut receiver, PIPE_RECV, Interest::READABLE)?;
-
-        println!("Reading data <- {}", &pipe_name);
-
-        match self.loop_till_stopped(&mut poll, &mut reader, &channels) {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                println!("{:?}", err);
-                return Err(err);
-            }
-        }
-    }
+}
+///
+pub struct PSplit {
+    reading_threads: Vec<thread::JoinHandle<Result<(), std::io::Error>>>,
+    running: bool,
+    signal: Arc<Mutex<u8>>,
+    configs: Vec<Arc<SplitIn>>,
 }
 
 impl PSplit {
@@ -482,60 +474,64 @@ impl PSplit {
             thread::sleep(TIME_OUT);
         }
     }
+}
 
+impl<'a> PSplit {
+    ///
     pub fn new() -> PSplit {
         PSplit {
             signal: Arc::new(Mutex::new(0)),
+            configs: Vec::new(),
             reading_threads: Vec::new(),
             running: false,
         }
     }
 
+    ///
+    pub fn config_from_file(&'a mut self, config_path: &str) -> &'a mut Self {
+        let config = match Parser::load_from_file(config_path) {
+            Ok(r) => r,
+            Err(e) => panic!("{}", e),
+        };
+        self.configs = config;
+        self
+    }
+
+    ///
+    pub fn start(&mut self) {
+        if self.configs.len() == 0 || self.running {
+            return;
+        }
+
+        for input in self.configs.iter() {
+            if !input.configuration.enabled || input.enabled_outputs() == 0 {
+                continue;
+            }
+
+            let signal = Arc::clone(&self.signal);
+            let config = Arc::clone(input);
+
+            let handle = thread::spawn(move || -> Result<(), std::io::Error> {
+                let mut reader = Reader::new(signal, config);
+
+                reader.start_write_channels().run_read_loop()
+            });
+
+            self.reading_threads.push(handle);
+        }
+
+        self.running = true;
+        Self::loop_for_ever();
+    }
+
+    ///
     fn shut_down(&mut self) {
         let mut num = self.signal.lock().unwrap();
         *num = 1;
         self.running = false;
     }
 
-    fn count_enabled_outputs(split_config: &SplitIn) -> i32 {
-        let mut i = 0;
-
-        for out in split_config.outputs.iter() {
-            if out.configuration.enabled {
-                i += 1;
-            }
-        }
-
-        return i;
-    }
-
-    pub fn start(&mut self, config_path: &str) {
-        let config = match Parser::load_from_file(config_path) {
-            Ok(r) => r,
-            Err(e) => panic!("{}", e),
-        };
-
-        self.running = true;
-
-        for input in config.into_iter() {
-            if !input.configuration.enabled || Self::count_enabled_outputs(&input) == 0 {
-                continue;
-            }
-
-            let signal = Arc::clone(&self.signal);
-
-            let handle = thread::spawn(move || -> Result<(), std::io::Error> {
-                let reader = Reader::new(signal);
-                let response = reader.start(input);
-                response
-            });
-
-            self.reading_threads.push(handle);
-        }
-
-        Self::loop_for_ever();
-    }
-
+    ///
     pub fn stop(&mut self) {}
 }
 
@@ -546,9 +542,7 @@ impl Drop for PSplit {
 }
 
 impl Drop for Writer {
-    fn drop(&mut self) {
-        println!("Dropping!!!")
-    }
+    fn drop(&mut self) {}
 }
 
 impl Drop for Reader {

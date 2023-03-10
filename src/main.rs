@@ -1,4 +1,4 @@
-use psplit::{PSplit};
+use psplit::split_pipes;
 
 use clap::Parser;
 
@@ -6,7 +6,7 @@ use clap::Parser;
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Absolute Path to configuration file
-    #[arg(short, long, value_name = "FILE", default_value_t = String::from("/usr/cvapps/pipes//config_splitter.ini"))]
+    #[arg(short, long, value_name = "FILE", default_value_t = String::from("/home/hp/projects/conview/box/pipes/config_splitter.ini"))]
     config: String,
 
     /// Log level
@@ -18,16 +18,15 @@ struct Cli {
     reload: bool,
 }
 
-fn run_with_reload(_cli: &Cli) {
+fn run_with_reload(_cli: &Cli) -> Result<(), std::io::Error> {
     todo!()
 }
 
-fn run(cli: &Cli) {
-    let mut splitter = PSplit::new();
-    splitter.config_from_file(&cli.config).start()
+fn run(cli: &Cli) -> Result<(), std::io::Error> {
+    split_pipes(&cli.config)
 }
 
-fn main() {
+fn main() -> Result<(), std::io::Error> {
     let cli = Cli::parse();
     if cli.reload {
         run_with_reload(&cli)

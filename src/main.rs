@@ -4,9 +4,9 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-struct Cli {
+struct Args {
     /// Absolute Path to configuration file
-    #[arg(short, long, value_name = "FILE", default_value_t = String::from("/home/hp/projects/conview/box/pipes/config_splitter.ini"))]
+    #[arg(short, long, value_name = "FILE", default_value_t = String::from("/usr/cvapps/pipes/config_splitter.ini"))]
     config: String,
 
     /// Log level
@@ -18,16 +18,17 @@ struct Cli {
     reload: bool,
 }
 
-fn run_with_reload(_cli: &Cli) -> Result<(), std::io::Error> {
+fn run_with_reload(_cli: &Args) -> Result<(), std::io::Error> {
     todo!()
 }
 
-fn run(cli: &Cli) -> Result<(), std::io::Error> {
+fn run(cli: &Args) -> Result<(), std::io::Error> {
     split_pipes(&cli.config)
 }
 
 fn main() -> Result<(), std::io::Error> {
-    let cli = Cli::parse();
+    let cli = Args::parse();
+    
     if cli.reload {
         run_with_reload(&cli)
     } else {
